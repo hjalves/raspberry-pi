@@ -1,0 +1,95 @@
+#!/bin/bash
+# sdr-mode: switch the Pi's RTL-SDR dongle between ADS-B (readsb) and the kernel DVB-T driver.
+#
+#   sdr-mode dvb     stop readsb, load dvb_usb_rtl28xxu, wait for /dev/dvb/adapter0
+#   sdr-mode adsb    unload the DVB driver, start readsb
+#   sdr-mode status  show which mode the dongle is in
+#
+# readsb stays enabled at boot and the DVB modules stay blacklisted
+# (/etc/modprobe.d/blacklist-rtlsdr-dvb.conf), so a reboot always comes back in ADS-B mode.
+# adsbfi-feed/adsbfi-mlat, tar1090 and lighttpd are left running: they only read readsb's
+# output and reconnect by themselves when it is back.
+set -euo pipefail
+
+DVB_MODS=(dvb_usb_rtl28xxu rtl2832_sdr rtl2832 r820t)
+ADAPTER=/dev/dvb/adapter0
+
+if [[ $EUID -ne 0 ]]; then
+    exec sudo "$0" "$@"
+fi
+
+status() {
+    local rs mods
+    rs=$(systemctl is-active readsb || true)
+    mods=$(lsmod | awk '$1=="dvb_usb_rtl28xxu"{print "loaded"}')
+    echo "readsb:     $rs"
+    echo "DVB driver: ${mods:-not loaded}"
+    if [[ -e $ADAPTER ]]; then
+        echo "DVB device: $ADAPTER ($(ls "$ADAPTER" | tr '\n' ' '))"
+    fi
+    if [[ $rs == active ]]; then
+        echo "mode: adsb"
+    elif [[ -n $mods ]]; then
+        echo "mode: dvb"
+    else
+        echo "mode: idle (neither readsb nor DVB driver)"
+    fi
+}
+
+to_dvb() {
+    echo "Stopping readsb (ADS-B and the adsb.fi feed pause until 'sdr-mode adsb')..."
+    systemctl stop readsb
+    echo "Loading DVB-T driver..."
+    modprobe dvb_usb_rtl28xxu
+    for _ in $(seq 1 20); do
+        [[ -e $ADAPTER/frontend0 ]] && break
+        sleep 0.5
+    done
+    if [[ ! -e $ADAPTER/frontend0 ]]; then
+        echo "error: $ADAPTER/frontend0 did not appear; check 'dmesg | tail'" >&2
+        exit 1
+    fi
+    echo "Ready: $ADAPTER. Scan with e.g. 'dvbv5-scan <initial-file> -o channels.conf'."
+    echo "When done: sdr-mode adsb"
+}
+
+to_adsb() {
+    if [[ -e $ADAPTER ]] && users=$(fuser "$ADAPTER"/* 2>/dev/null) && [[ -n ${users// /} ]]; then
+        echo "error: the DVB device is still in use by:" >&2
+        fuser -v "$ADAPTER"/* >&2 || true
+        echo "Stop those programs (e.g. dvbv5-zap) first." >&2
+        exit 1
+    fi
+    echo "Unloading DVB-T driver..."
+    # The modules hold references on each other (the USB driver pulls in the demodulator,
+    # tuner and SDR sub-drivers), so unload in passes until none is left.
+    local left
+    for _ in 1 2 3 4; do
+        left=()
+        for m in "${DVB_MODS[@]}"; do
+            if lsmod | awk -v m="$m" '$1==m{f=1} END{exit !f}'; then
+                modprobe -r "$m" 2>/dev/null || left+=("$m")
+            fi
+        done
+        [[ ${#left[@]} -eq 0 ]] && break
+    done
+    if [[ ${#left[@]} -gt 0 ]]; then
+        echo "warning: still loaded: ${left[*]} (readsb normally detaches the driver anyway)" >&2
+    fi
+    echo "Starting readsb..."
+    systemctl start readsb
+    sleep 3
+    if systemctl is-active -q readsb; then
+        echo "ADS-B mode: readsb is running; adsb.fi feed/MLAT reconnect within a minute."
+    else
+        echo "error: readsb failed to start; see 'journalctl -u readsb -n 20'" >&2
+        exit 1
+    fi
+}
+
+case ${1:-status} in
+    dvb) to_dvb ;;
+    adsb) to_adsb ;;
+    status) status ;;
+    *) echo "usage: sdr-mode {dvb|adsb|status}" >&2; exit 2 ;;
+esac
