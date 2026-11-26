@@ -13,10 +13,11 @@ full-time ADS-B receiver:
 | File | Installed as |
 |---|---|
 | `sdr-mode` | `/usr/local/bin/sdr-mode` |
+| `dvb-aim` | `/usr/local/bin/dvb-aim` |
 | `modprobe.d/blacklist-rtlsdr-dvb.conf` | `/etc/modprobe.d/blacklist-rtlsdr-dvb.conf` |
 
 ```
-sudo install -m755 sdr-mode /usr/local/bin/sdr-mode
+sudo install -m755 sdr-mode dvb-aim /usr/local/bin/
 sudo install -m644 modprobe.d/blacklist-rtlsdr-dvb.conf /etc/modprobe.d/
 ```
 
@@ -34,6 +35,23 @@ sdr-mode status
 readsb stays enabled and the DVB modules stay blacklisted, so a reboot always comes back in
 ADS-B mode. The adsb.fi services, tar1090 and lighttpd keep running in DVB mode; they only read
 readsb's output and reconnect when it's back.
+
+### dvb-aim
+
+Live DVB-T channel levels for pointing an antenna (`/usr/local/bin/dvb-aim`, Python stdlib only,
+needs `rtl-sdr` and `dvb-tools`):
+
+```
+dvb-aim                    # channels 43,45,48; lock check every 5 passes
+dvb-aim -c 40,43 --lock-every 0 -i 2
+```
+
+Each ~2 s pass prints every channel's level in dB above the noise floor, measured with
+`rtl_power`. That works without a DVB lock, which matters because this dongle's DVB driver
+reports no signal statistics at all until it locks. Every N passes it loads the DVB-T driver and
+asks `dvbv5-zap` for lock, signal and C/N (about 5 s per channel). readsb is stopped while it
+runs and restarted on exit, Ctrl-C included. As a rough guide, DVB-T 64-QAM needs about
+18–20 dB C/N to decode cleanly.
 
 ### DVB driver blacklist
 
