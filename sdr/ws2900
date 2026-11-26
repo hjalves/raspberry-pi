@@ -21,7 +21,8 @@ How it works, step by step:
        FF II DD VT TT HH WW GG RR RR UU UU LL LL LL CC BB
      family 0x24, id, wind direction (9 bits), flags, temperature (11 bits, (raw-400)/10 C),
      humidity, wind speed (9 bits, raw/8 * 0.51 m/s), gust (raw * 0.51 m/s),
-     rain counter (0.254 mm per tip), UV (raw), light (raw/10 lux)
+     rain counter (0.254 mm per tip), UV (raw, plus UV index from rtl_433's thresholds),
+     light (raw/10 lux)
 """
 import argparse
 import json
@@ -50,6 +51,15 @@ def crc8(data, poly=0x31, init=0x00):
     return c
 
 
+# UV index from the sensor's raw UV value: upper bound of each index 0..12 (13 above the last),
+# the same thresholds as rtl_433's fineoffset.c
+UVI_UPPER = [432, 851, 1210, 1570, 2017, 2450, 2761, 3100, 3512, 3918, 4277, 4650, 5029]
+
+
+def uv_index(uv):
+    return sum(1 for u in UVI_UPPER if u < uv)
+
+
 def parse(b):
     """b: 17 payload bytes after the sync word. Returns a dict, or None if a check fails."""
     if len(b) < 17 or b[0] != 0x24:
@@ -71,6 +81,7 @@ def parse(b):
         "wind_max_m_s": round(b[7] * 0.51, 3) if b[7] != 0xFF else None,
         "rain_mm": round((b[8] << 8 | b[9]) * 0.254, 3),
         "uv": uv if uv != 0xFFFF else None,
+        "uvi": uv_index(uv) if uv != 0xFFFF else None,
         "light_lux": round(light * 0.1, 1) if light != 0xFFFFFF else None,
     }
     return r
@@ -197,7 +208,7 @@ def show(t, r, payload, args, info):
     line = (f"{t}  id {r['id']}  {v(r['temperature_C'], '{:.1f} °C')}  {v(r['humidity'], '{} %')}  "
             f"wind {v(r['wind_avg_m_s'], '{:.2f}')}/{v(r['wind_max_m_s'], '{:.2f}')} m/s "
             f"from {v(r['wind_dir_deg'], '{}°')}  rain {r['rain_mm']:.3f} mm  "
-            f"UV {v(r['uv'], '{}')}  light {v(r['light_lux'], '{:.0f} lux')}"
+            f"UV {v(r['uv'], '{}')} (UVI {v(r['uvi'], '{}')})  light {v(r['light_lux'], '{:.0f} lux')}"
             + ("" if r["battery_ok"] else "  LOW BATTERY"))
     print(line, flush=True)
     if args.raw:

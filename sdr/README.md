@@ -63,7 +63,8 @@ runs and restarted on exit, Ctrl-C included. As a rough guide, DVB-T 64-QAM need
 Decodes the WS2900 weather station's outdoor sensor (a Fine Offset WH65, 868 MHz FSK, one packet
 every 16 s) with its own demodulator: burst detection, FM discriminator, bit-clock recovery,
 `aa 2d d4` sync, CRC-8 + byte-sum check, then the WH24/WH65 fields (layout as documented in
-rtl_433's `fineoffset.c`). The UV value is shown raw (no UV-index table).
+rtl_433's `fineoffset.c`), with the UV index worked out from the raw UV value using rtl_433's
+thresholds.
 
 ```
 ws2900                     # live, until Ctrl-C (pauses readsb, restarts it on exit)
