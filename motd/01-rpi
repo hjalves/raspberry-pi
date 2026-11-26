@@ -1,0 +1,147 @@
+#!/bin/bash
+# Raspberry Pi login summary (installed as /etc/update-motd.d/01-rpi).
+# Runs as root on every login via pam_motd, so keep it fast and never let it block.
+# Same layout as atom's 01-atom; Pi additions: throttling/under-voltage, and the RTL-SDR (readsb).
+
+esc=$'\e'
+b="$esc[1m"; d="$esc[2m"; r="$esc[0m"
+grn="$esc[32m"; red="$esc[31m"; yel="$esc[33m"; cyn="$esc[36m"
+
+. /etc/os-release
+kernel=$(uname -r)
+up=$(uptime -p | sed 's/^up //')
+model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
+
+label() { printf "  ${d}%-9s${r}" "$1"; }
+sep() { printf "  ${d}·${r}  "; }
+
+bar() { # percent width
+  local p=$1 w=$2 n c=$grn
+  n=$(( p * w / 100 ))
+  (( p >= 75 )) && c=$yel
+  (( p >= 90 )) && c=$red
+  printf "%s" "$c"
+  for ((i = 0; i < w; i++)); do
+    if (( i < n )); then printf "━"; else printf "%s─%s" "$d" "$r$c"; fi
+  done
+  printf "%s" "$r"
+}
+
+echo
+printf "  ${b}${cyn}%s${r}  ${d}·${r}  %s  ${d}·${r}  kernel %s  ${d}·${r}  up %s\n" \
+  "$(hostname)" "$PRETTY_NAME" "$kernel" "$up"
+[[ -n $model ]] && printf "  ${d}%s${r}\n" "$model"
+echo
+
+# System: load, memory, temperature
+read -r l1 l5 l15 _ < /proc/loadavg
+cores=$(nproc)
+mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+mem_avail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+mem_used=$(( mem_total - mem_avail ))
+temp=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1)
+[[ -n $temp ]] && temp=$(( temp / 1000 ))
+label "System"
+printf "load %s %s %s ${d}(%s cores)${r}  ${d}·${r}  memory %s / %s" \
+  "$l1" "$l5" "$l15" "$cores" \
+  "$(numfmt --to=iec --from-unit=1024 --format=%.1f "$mem_used")" \
+  "$(numfmt --to=iec --from-unit=1024 --format=%.1f "$mem_total")"
+[[ -n $temp ]] && printf "  ${d}·${r}  %s°C" "$temp"
+echo
+
+# Power: the firmware's throttling flags (bits 0-3 = now, 16-19 = has happened since boot)
+thr=$(timeout 2 vcgencmd get_throttled 2>/dev/null | sed -n 's/^throttled=//p')
+if [[ -n $thr ]]; then
+  t=$(( thr ))
+  names=("under-voltage" "frequency capped" "throttled" "soft temperature limit")
+  now=(); past=()
+  for i in 0 1 2 3; do
+    (( t >> i & 1 )) && now+=("${names[$i]}")
+    (( t >> (i + 16) & 1 )) && past+=("${names[$i]}")
+  done
+  label "Power"
+  if (( ${#now[@]} )); then
+    printf "${red}${b}%s${r}" "$(IFS=,; echo "${now[*]}" | sed 's/,/, /g')"
+  else
+    printf "${grn}ok${r}"
+  fi
+  if (( ${#past[@]} )); then
+    sep; printf "${yel}since boot: %s${r}" "$(IFS=,; echo "${past[*]}" | sed 's/,/, /g')"
+  fi
+  printf "  ${d}(%s)${r}\n" "$thr"
+fi
+
+# Disks
+first=1
+while read -r target size used pcent; do
+  p=${pcent%\%}
+  if (( first )); then label "Disks"; first=0; else printf "  %-9s" ""; fi
+  printf "%-14s " "$target"; bar "$p" 24
+  printf "  %3s%%  ${d}%s of %s${r}\n" "$p" "$used" "$size"
+done < <(df -h --output=target,size,used,pcent / /boot/firmware 2>/dev/null | tail -n +2)
+
+# Network
+lan=$(ip -4 -br addr show eth0 2>/dev/null | awk '{sub("/.*", "", $3); print $3}')
+label "Network"
+printf "eth0 %s\n" "${lan:-down}"
+
+# Service states, fetched once (each systemctl call costs ~0.35 s on a Pi 1)
+services=(readsb tar1090 lighttpd landing adsbfi-feed adsbfi-mlat ssh systemd-timesyncd)
+mapfile -t states < <(systemctl is-active "${services[@]}" 2>/dev/null)
+declare -A state
+for i in "${!services[@]}"; do state[${services[$i]}]=${states[$i]}; done
+
+# SDR: which mode the dongle is in, and how readsb is doing
+label "SDR"
+if [[ ${state[readsb]} == active ]]; then
+  printf "${grn}ADS-B${r} (readsb)"
+  # one jq run for both files: aircraft now, aircraft with position, messages and max range (last minute)
+  js=$(timeout 2 jq -rn --slurpfile a /run/readsb/aircraft.json --slurpfile s /run/readsb/stats.json \
+       '($a[0].aircraft) as $ac | ($s[0].last1min) as $m
+        | "\($ac | length) \([$ac[] | select(.lat)] | length) \($m.messages // 0) \($m.max_distance // 0)"' 2>/dev/null)
+  if [[ -n $js ]]; then
+    read -r n pos msgs maxd <<< "$js"
+    sep; printf "%s aircraft ${d}(%s with position)${r}" "$n" "$pos"
+    sep; printf "%s msg/s" "$(( msgs / 60 ))"
+    (( maxd > 0 )) && { sep; printf "range %s km" "$(( maxd / 1000 ))"; }
+  fi
+  if [[ ${state[adsbfi-feed]} == active ]]; then
+    if ss -Htn state established '( dport = :30004 )' 2>/dev/null | grep -q .; then
+      sep; printf "adsb.fi ${grn}connected${r}"
+    else
+      sep; printf "adsb.fi ${red}not connected${r}"
+    fi
+  fi
+  echo
+elif pgrep -f '^python3 /usr/local/bin/dvb-aim' >/dev/null; then
+  printf "${yel}antenna aiming${r} ${d}(dvb-aim running; readsb comes back when it exits)${r}\n"
+elif grep -q '^dvb_usb_rtl28xxu ' /proc/modules; then
+  printf "${yel}DVB-T mode${r} ${d}(readsb stopped; 'sdr-mode adsb' to go back)${r}\n"
+else
+  printf "${red}idle${r} ${d}(readsb stopped, DVB driver not loaded)${r}\n"
+fi
+
+# Services
+label "Services"
+line=""; len=0
+for i in "${!services[@]}"; do
+  s=${services[$i]}
+  if [[ ${states[$i]} == active ]]; then dot="${grn}●${r}"; else dot="${red}●${r}"; fi
+  if (( len + ${#s} + 4 > 64 )); then printf "%s\n  %-9s" "${line%  }" ""; line=""; len=0; fi
+  line+="$dot $s  "; len=$(( len + ${#s} + 4 ))
+done
+printf "%s\n" "${line%  }"
+
+# Problems worth noticing
+failed=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+if [[ -n $failed ]]; then
+  echo
+  printf "  ${red}${b}failed:${r} %s\n" "$(echo $failed)"
+fi
+if [[ -f /run/reboot-required ]]; then
+  echo
+  printf "  ${yel}${b}reboot required${r}"
+  [[ -f /run/reboot-required.pkgs ]] && printf " ${d}(%s)${r}" "$(sort -u /run/reboot-required.pkgs | tr '\n' ' ' | sed 's/ $//')"
+  echo
+fi
+echo
