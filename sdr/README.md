@@ -14,10 +14,11 @@ full-time ADS-B receiver:
 |---|---|
 | `sdr-mode` | `/usr/local/bin/sdr-mode` |
 | `dvb-aim` | `/usr/local/bin/dvb-aim` |
+| `ws2900` | `/usr/local/bin/ws2900` (needs `python3-numpy`) |
 | `modprobe.d/blacklist-rtlsdr-dvb.conf` | `/etc/modprobe.d/blacklist-rtlsdr-dvb.conf` |
 
 ```
-sudo install -m755 sdr-mode dvb-aim /usr/local/bin/
+sudo install -m755 sdr-mode dvb-aim ws2900 /usr/local/bin/
 sudo install -m644 modprobe.d/blacklist-rtlsdr-dvb.conf /etc/modprobe.d/
 ```
 
@@ -56,6 +57,24 @@ reports no signal statistics at all until it locks. Every N passes it loads the 
 asks `dvbv5-zap` for lock, signal and C/N (about 5 s per channel). readsb is stopped while it
 runs and restarted on exit, Ctrl-C included. As a rough guide, DVB-T 64-QAM needs about
 18–20 dB C/N to decode cleanly.
+
+### ws2900
+
+Decodes the WS2900 weather station's outdoor sensor (a Fine Offset WH65, 868 MHz FSK, one packet
+every 16 s) with its own demodulator: burst detection, FM discriminator, bit-clock recovery,
+`aa 2d d4` sync, CRC-8 + byte-sum check, then the WH24/WH65 fields (layout as documented in
+rtl_433's `fineoffset.c`). The UV value is shown raw (no UV-index table).
+
+```
+ws2900                     # live, until Ctrl-C (pauses readsb, restarts it on exit)
+ws2900 --minutes 2 --json  # one JSON object per reading
+ws2900 --raw               # also packet bytes and bursts that didn't decode
+ws2900 --file rec.cu8 --rate 1024000 --centre 868000000   # decode a recording
+```
+
+Live it runs `rtl_sdr` at 868.2 MHz / 300 kHz (the sensor's tones sit near 868.25 and 868.32 MHz),
+about 60% CPU on a Pi 1. It uses Raspbian's `python3-numpy`, since uv-managed Pythons don't support
+the Pi 1's ARMv6. Checked against rtl_433 on the same recording: identical readings.
 
 ### DVB driver blacklist
 

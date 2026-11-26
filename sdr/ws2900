@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""ws2900: decode the WS2900 weather station's outdoor sensor (Fine Offset WH65, 868 MHz) with the RTL-SDR.
+
+usage: ws2900 [--minutes N] [--json] [--raw]
+       ws2900 --file CAPTURE.cu8 --rate HZ --centre HZ [--json] [--raw]
+
+Live mode pauses readsb (ADS-B), runs rtl_sdr at 868.2 MHz / 300 kHz, prints every packet, and
+restarts readsb on exit (Ctrl-C included). File mode decodes an 8-bit unsigned IQ recording.
+
+How it works, step by step:
+  1. find bursts: the sensor sends one ~13 ms packet every 16 s; look for 1 ms blocks well above
+     the noise floor
+  2. FM demodulation: the phase change between consecutive samples is the instantaneous frequency;
+     the packet uses two tones about 70 kHz apart (FSK)
+  3. bit slicing and clock recovery: 58 us per bit (17.24 kbit/s); threshold halfway between the two
+     tones, resynchronise the bit clock on every transition, sample mid-bit
+  4. framing: preamble aa aa ..., sync word 2d d4, then 17 bytes
+  5. integrity: CRC-8 (poly 0x31, init 0) over 16 bytes must be 0, and the byte sum of the first 16
+     bytes must equal byte 17
+  6. fields (WH24/WH65 layout, as documented in rtl_433's fineoffset.c):
+       FF II DD VT TT HH WW GG RR RR UU UU LL LL LL CC BB
+     family 0x24, id, wind direction (9 bits), flags, temperature (11 bits, (raw-400)/10 C),
+     humidity, wind speed (9 bits, raw/8 * 0.51 m/s), gust (raw * 0.51 m/s),
+     rain counter (0.254 mm per tip), UV (raw), light (raw/10 lux)
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+BIT_S = 58e-6                       # bit period
+SYNC_BITS = "10101010" + "0010110111010100"  # aa 2d d4
+LIVE_FREQ = 868_200_000              # sensor tones sit near 868.25 / 868.32 MHz: +50 / +120 kHz
+LIVE_RATE = 300_000
+
+
+# ---------------------------------------------------------------- packet layer
+
+def crc8(data, poly=0x31, init=0x00):
+    c = init
+    for b in data:
+        c ^= b
+        for _ in range(8):
+            c = ((c << 1) ^ poly) & 0xFF if c & 0x80 else (c << 1) & 0xFF
+    return c
+
+
+def parse(b):
+    """b: 17 payload bytes after the sync word. Returns a dict, or None if a check fails."""
+    if len(b) < 17 or b[0] != 0x24:
+        return None
+    if crc8(b[:16]) != 0 or (sum(b[:16]) & 0xFF) != b[16]:
+        return None
+    wind_dir = b[2] | (b[3] & 0x80) << 1
+    temp_raw = (b[3] & 0x07) << 8 | b[4]
+    wind_raw = b[6] | (b[3] & 0x10) << 4
+    uv = b[10] << 8 | b[11]
+    light = b[12] << 16 | b[13] << 8 | b[14]
+    r = {
+        "id": b[1],
+        "battery_ok": not (b[3] & 0x08),
+        "temperature_C": round((temp_raw - 400) * 0.1, 1) if temp_raw != 0x7FF else None,
+        "humidity": b[5] if b[5] != 0xFF else None,
+        "wind_dir_deg": wind_dir if wind_dir != 0x1FF else None,
+        "wind_avg_m_s": round(wind_raw * 0.125 * 0.51, 3) if wind_raw != 0x1FF else None,
+        "wind_max_m_s": round(b[7] * 0.51, 3) if b[7] != 0xFF else None,
+        "rain_mm": round((b[8] << 8 | b[9]) * 0.254, 3),
+        "uv": uv if uv != 0xFFFF else None,
+        "light_lux": round(light * 0.1, 1) if light != 0xFFFFFF else None,
+    }
+    return r
+
+
+def bits_to_bytes(bits):
+    return bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits) - 7, 8))
+
+
+# ---------------------------------------------------------------- signal layer
+
+def demod_burst(x, fs):
+    """x: complex baseband samples covering one burst. Returns (payload bytes or None, info)."""
+    # 2. FM discriminator: instantaneous frequency in Hz
+    f = np.angle(x[1:] * np.conj(x[:-1])) * fs / (2 * np.pi)
+    # keep only the strong part of the burst (drop the edges where it's just noise)
+    mag = np.abs(x[1:])
+    on = mag > 0.5 * np.percentile(mag, 95)
+    idx = np.flatnonzero(on)
+    if len(idx) < 50:
+        return None, "too short"
+    f = f[idx[0]:idx[-1]]
+    # smooth over ~1/3 bit to tame noise
+    spb = BIT_S * fs
+    k = max(1, int(spb / 3))
+    fsm = np.convolve(f, np.ones(k) / k, mode="same")
+    # two tones: threshold halfway between them
+    lo, hi = np.percentile(fsm, 10), np.percentile(fsm, 90)
+    mid = (lo + hi) / 2
+    hard = fsm > mid
+    info = f"tones {lo/1e3:+.0f}/{hi/1e3:+.0f} kHz"
+    # 3. clock recovery: walk through the burst, resync on each transition, sample mid-bit
+    trans = np.flatnonzero(hard[1:] != hard[:-1]) + 1
+    if len(trans) < 10:
+        return None, info + ", no transitions"
+    bits = []
+    t = trans[0]               # a bit boundary
+    ti = 0
+    n = len(hard)
+    while t + spb <= n:
+        # next transition near the end of this bit? use it as the true boundary
+        while ti < len(trans) and trans[ti] <= t + spb * 0.5:
+            ti += 1
+        bits.append("1" if hard[int(t + spb / 2)] else "0")
+        if ti < len(trans) and abs(trans[ti] - (t + spb)) < spb * 0.5:
+            t = trans[ti]
+        else:
+            t = t + spb
+    bitstr = "".join(bits)
+    # 4. framing: find aa 2d d4 (either tone polarity)
+    for s in (bitstr, bitstr.translate(str.maketrans("01", "10"))):
+        p = s.find(SYNC_BITS)
+        if p >= 0:
+            payload = bits_to_bytes(s[p + len(SYNC_BITS):p + len(SYNC_BITS) + 17 * 8])
+            return payload, info + f", {len(bitstr)} bits"
+    return None, info + f", {len(bitstr)} bits, sync not found"
+
+
+class BurstFinder:
+    """Feed complex samples; yields complete bursts (with a little margin)."""
+
+    def __init__(self, fs, offset_hz):
+        self.fs = fs
+        self.blk = int(fs / 1000)  # 1 ms
+        self.buf = np.zeros(0, np.complex64)
+        self.t0 = 0                # sample index of buf[0]
+        self.noise = None
+        self.mix = None
+        self.offset = offset_hz
+        self.n_mixed = 0
+
+    def feed(self, x):
+        # shift the sensor's band to 0 Hz
+        ph = np.exp(-2j * np.pi * self.offset * (np.arange(len(x)) + self.n_mixed) / self.fs)
+        self.n_mixed += len(x)
+        x = (x * ph).astype(np.complex64)
+        self.buf = np.concatenate([self.buf, x])
+        nb = len(self.buf) // self.blk
+        if nb < 30:
+            return
+        p = (np.abs(self.buf[:nb * self.blk].reshape(nb, self.blk)) ** 2).mean(1)
+        med = float(np.median(p))
+        self.noise = med if self.noise is None else 0.9 * self.noise + 0.1 * min(med, self.noise * 3)
+        hot = np.flatnonzero(p > self.noise * 8)  # ~9 dB above the noise floor
+        done_upto = nb - 3  # keep the last few ms in case a burst continues
+        if len(hot):
+            start = hot[0]
+            end = start
+            while end + 1 < nb and (end + 1 in hot or end + 2 in hot):
+                end += 1
+            if end < done_upto:
+                a = max(0, (start - 1) * self.blk)
+                b = (end + 2) * self.blk
+                yield (self.t0 + a) / self.fs, self.buf[a:b]
+                self.t0 += b
+                self.buf = self.buf[b:]
+                return
+            # burst still in progress: drop only what's before it
+            cut = max(0, (start - 2) * self.blk)
+            self.t0 += cut
+            self.buf = self.buf[cut:]
+            return
+        cut = done_upto * self.blk
+        self.t0 += cut
+        self.buf = self.buf[cut:]
+
+
+def to_iq(raw):
+    a = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 127.4
+    return (a[0::2] + 1j * a[1::2]).astype(np.complex64)
+
+
+# ---------------------------------------------------------------- output
+
+def show(t, r, payload, args, info):
+    if args.json:
+        out = {"time": t, **r}
+        if args.raw:
+            out["raw"] = payload.hex()
+        print(json.dumps(out), flush=True)
+        return
+    def v(x, fmt):
+        return fmt.format(x) if x is not None else "-"
+    line = (f"{t}  id {r['id']}  {v(r['temperature_C'], '{:.1f} °C')}  {v(r['humidity'], '{} %')}  "
+            f"wind {v(r['wind_avg_m_s'], '{:.2f}')}/{v(r['wind_max_m_s'], '{:.2f}')} m/s "
+            f"from {v(r['wind_dir_deg'], '{}°')}  rain {r['rain_mm']:.3f} mm  "
+            f"UV {v(r['uv'], '{}')}  light {v(r['light_lux'], '{:.0f} lux')}"
+            + ("" if r["battery_ok"] else "  LOW BATTERY"))
+    print(line, flush=True)
+    if args.raw:
+        print(f"    raw {payload.hex()}  ({info})", flush=True)
+
+
+def handle(tstr, burst, fs, args):
+    payload, info = demod_burst(burst, fs)
+    if payload is None:
+        if args.raw:
+            print(f"{tstr}  burst, not decoded ({info})", flush=True)
+        return
+    r = parse(payload)
+    if r is None:
+        if args.raw:
+            print(f"{tstr}  bad checksum/family: {payload.hex()} ({info})", flush=True)
+        return
+    show(tstr, r, payload, args, info)
+
+
+def run_file(args):
+    raw = open(args.file, "rb").read()
+    x = to_iq(raw)
+    x -= x.mean()
+    bf = BurstFinder(args.rate, args.sensor - args.centre)
+    step = int(args.rate * 0.1)
+    for i in range(0, len(x), step):
+        for t, burst in bf.feed(x[i:i + step]):
+            handle(f"@{t:.3f}s", burst, args.rate, args)
+
+
+def run_live(args):
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.argv[0]] + sys.argv[1:])
+    proc = None
+
+    def restore(*_):
+        if proc and proc.poll() is None:
+            proc.terminate()
+        subprocess.run(["systemctl", "start", "readsb"])
+        print("\nreadsb restarted (ADS-B mode)", file=sys.stderr, flush=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, restore)
+    signal.signal(signal.SIGTERM, restore)
+    subprocess.run(["systemctl", "stop", "readsb"], check=True)
+    # the kernel DVB driver may be loaded (dvb-aim, sdr-mode); librtlsdr detaches it anyway
+    proc = subprocess.Popen(["rtl_sdr", "-f", str(LIVE_FREQ), "-s", str(LIVE_RATE), "-g", str(args.gain), "-"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    print(f"listening on {args.sensor/1e6:.2f} MHz (readsb paused; Ctrl-C to stop). "
+          "The sensor sends every 16 s.", file=sys.stderr, flush=True)
+    bf = BurstFinder(LIVE_RATE, args.sensor - LIVE_FREQ)
+    chunk = LIVE_RATE // 10 * 2  # 0.1 s of bytes
+    end = time.time() + args.minutes * 60 if args.minutes else None
+    dc = None
+    t_start = None  # wall-clock time of the first sample; packet times come from the sample count
+    while end is None or time.time() < end:
+        raw = proc.stdout.read(chunk)
+        if not raw:
+            print("rtl_sdr stopped", file=sys.stderr)
+            break
+        if t_start is None:
+            t_start = time.time() - len(raw) / 2 / LIVE_RATE
+        x = to_iq(raw)
+        m = x.mean()
+        dc = m if dc is None else 0.95 * dc + 0.05 * m
+        for t, burst in bf.feed(x - dc):
+            handle(time.strftime("%H:%M:%S", time.localtime(t_start + t)), burst, LIVE_RATE, args)
+    restore()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--minutes", type=float, default=0, help="stop after N minutes (default: run until Ctrl-C)")
+    ap.add_argument("--json", action="store_true", help="one JSON object per reading")
+    ap.add_argument("--raw", action="store_true", help="also show the packet bytes and undecodable bursts")
+    ap.add_argument("--gain", type=float, default=40, help="tuner gain in dB (live mode)")
+    ap.add_argument("--sensor", type=float, default=868.29e6, help="sensor centre frequency in Hz")
+    ap.add_argument("--file", help="decode an 8-bit IQ (cu8) recording instead of listening live")
+    ap.add_argument("--rate", type=float, help="sample rate of --file in Hz")
+    ap.add_argument("--centre", type=float, help="centre frequency of --file in Hz")
+    args = ap.parse_args()
+    if args.file:
+        if not (args.rate and args.centre):
+            ap.error("--file needs --rate and --centre")
+        run_file(args)
+    else:
+        run_live(args)
+
+
+if __name__ == "__main__":
+    main()
