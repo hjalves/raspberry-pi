@@ -27,7 +27,7 @@ Only one program can use the dongle at a time. `sdr-mode` switches it between re
 kernel DVB-T driver (for `dvbv5-scan` and friends):
 
 ```
-sdr-mode dvb      # stop readsb, load dvb_usb_rtl28xxu, wait for /dev/dvb/adapter0
+sdr-mode dvb      # stop readsb, load dvb_usb_rtl28xxu, wait until /dev/dvb/adapter0 is usable
 sdr-mode adsb     # unload the DVB-T driver, start readsb
 sdr-mode status
 ```
@@ -35,6 +35,10 @@ sdr-mode status
 readsb stays enabled and the DVB modules stay blacklisted, so a reboot always comes back in
 ADS-B mode. The adsb.fi services, tar1090 and lighttpd keep running in DVB mode; they only read
 readsb's output and reconnect when it's back.
+
+The DVB device nodes start out root-only and udev opens them to the `plugdev` group a few seconds
+later; `sdr-mode dvb` waits for that (`udevadm settle`), so members of `plugdev` can use
+`dvbv5-scan` and friends without sudo.
 
 ### dvb-aim
 

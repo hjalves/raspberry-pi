@@ -49,6 +49,9 @@ to_dvb() {
         echo "error: $ADAPTER/frontend0 did not appear; check 'dmesg | tail'" >&2
         exit 1
     fi
+    # The kernel creates the nodes root-only; udev gives them group access a few seconds later
+    # (plugdev/video). Wait for that so non-root users can open them straight away.
+    udevadm settle --timeout=15 || true
     echo "Ready: $ADAPTER. Scan with e.g. 'dvbv5-scan <initial-file> -o channels.conf'."
     echo "When done: sdr-mode adsb"
 }
