@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """dvb-aim: live DVB-T channel levels for pointing an antenna.
 
-usage: dvb-aim [-c 43,45,48] [-i SECONDS] [--lock-every N] [-g GAIN]
+usage: dvb-aim [-c 43] [-i SECONDS] [--lock-every N] [-g GAIN]
 
 Each pass measures every channel's level in dB above the noise floor with rtl_power, which
 works without a DVB lock (this dongle's DVB driver reports no signal statistics at all until it
@@ -117,7 +117,7 @@ def bar(db, scale=1.0, width=25):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-c", "--channels", default="43,45,48", help="UHF channels (default 43,45,48)")
+    ap.add_argument("-c", "--channels", default="43", help="UHF channel(s), comma-separated (default 43)")
     ap.add_argument("-i", "--interval", type=float, default=1, help="rtl_power integration seconds per pass")
     ap.add_argument("--lock-every", type=int, default=5, help="lock check every N passes (0 = never)")
     ap.add_argument("-g", "--gain", type=float, default=40, help="tuner gain in dB (default 40)")

@@ -46,7 +46,7 @@ Live DVB-T channel levels for pointing an antenna (`/usr/local/bin/dvb-aim`, Pyt
 needs `rtl-sdr` and `dvb-tools`):
 
 ```
-dvb-aim                    # channels 43,45,48; lock check every 5 passes
+dvb-aim                    # channel 43; lock check every 5 passes
 dvb-aim -c 40,43 --lock-every 0 -i 2
 ```
 
