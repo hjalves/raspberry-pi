@@ -2,7 +2,11 @@
 # Raspberry Pi login summary (installed as /etc/update-motd.d/01-rpi).
 # Runs as root on every login via pam_motd, so keep it fast and never let it block.
 # Same layout as atom's 01-atom; Pi additions: throttling/under-voltage, and the RTL-SDR (readsb).
+# Every line fits in $W columns (a phone SSH client); long lines wrap onto aligned continuations.
 
+export LC_ALL=C.UTF-8   # pam_motd may run this without a locale; ${#s} must count ━ ● ° as one column
+shopt -s extglob
+W=58
 esc=$'\e'
 b="$esc[1m"; d="$esc[2m"; r="$esc[0m"
 grn="$esc[32m"; red="$esc[31m"; yel="$esc[33m"; cyn="$esc[36m"
@@ -12,8 +16,25 @@ kernel=$(uname -r)
 up=$(uptime -p | sed 's/^up //')
 model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
 
-label() { printf "  ${d}%-9s${r}" "$1"; }
-sep() { printf "  ${d}·${r}  "; }
+P2="           "        # continuation indent: lines up under the value column
+lab() { printf -v P1 "  ${d}%-9s${r}" "$1"; }   # first-line prefix: "  Label    "
+SEP="${d} · ${r}"
+
+# wrap FIRST_PREFIX CONT_PREFIX SEP ITEM...: print the items joined by SEP, starting a new line
+# (with CONT_PREFIX) before any item that would pass column $W. Widths ignore colour codes.
+wrap() {
+  local line=$1 p2=$2 sep=$3 it v len n; shift 3
+  v=${line//$'\e'\[*([0-9;])m/}; len=${#v}
+  v=${sep//$'\e'\[*([0-9;])m/}; local sl=${#v} first=1
+  for it; do
+    [[ -n $it ]] || continue
+    v=${it//$'\e'\[*([0-9;])m/}; n=${#v}
+    if (( first )); then line+=$it; (( len += n )); first=0
+    elif (( len + sl + n > W )); then printf '%s\n' "$line"; line=$p2$it; len=$(( ${#p2} + n ))
+    else line+=$sep$it; (( len += sl + n )); fi
+  done
+  printf '%s\n' "$line"
+}
 
 bar() { # percent width
   local p=$1 w=$2 n c=$grn
@@ -28,8 +49,7 @@ bar() { # percent width
 }
 
 echo
-printf "  ${b}${cyn}%s${r}  ${d}·${r}  %s  ${d}·${r}  kernel %s  ${d}·${r}  up %s\n" \
-  "$(hostname)" "$PRETTY_NAME" "$kernel" "$up"
+wrap "  " "  " "$SEP" "${b}${cyn}$(hostname)${r}" "$PRETTY_NAME" "kernel $kernel" "up $up"
 [[ -n $model ]] && printf "  ${d}%s${r}\n" "$model"
 echo
 
@@ -41,13 +61,11 @@ mem_avail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
 mem_used=$(( mem_total - mem_avail ))
 temp=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1)
 [[ -n $temp ]] && temp=$(( temp / 1000 ))
-label "System"
-printf "load %s %s %s ${d}(%s cores)${r}  ${d}·${r}  memory %s / %s" \
-  "$l1" "$l5" "$l15" "$cores" \
-  "$(numfmt --to=iec --from-unit=1024 --format=%.1f "$mem_used")" \
-  "$(numfmt --to=iec --from-unit=1024 --format=%.1f "$mem_total")"
-[[ -n $temp ]] && printf "  ${d}·${r}  %s°C" "$temp"
-echo
+(( cores == 1 )) && cs=core || cs=cores
+lab "System"
+wrap "$P1" "$P2" "$SEP" "load $l1 $l5 $l15 ${d}($cores $cs)${r}" \
+  "memory $(numfmt --to=iec --from-unit=1024 --format=%.1f "$mem_used") / $(numfmt --to=iec --from-unit=1024 --format=%.1f "$mem_total")" \
+  "${temp:+${temp}°C}"
 
 # Power: the firmware's throttling flags (bits 0-3 = now, 16-19 = has happened since boot)
 thr=$(timeout 2 vcgencmd get_throttled 2>/dev/null | sed -n 's/^throttled=//p')
@@ -59,44 +77,48 @@ if [[ -n $thr ]]; then
     (( t >> i & 1 )) && now+=("${names[$i]}")
     (( t >> (i + 16) & 1 )) && past+=("${names[$i]}")
   done
-  label "Power"
+  items=()
   if (( ${#now[@]} )); then
-    printf "${red}${b}%s${r}" "$(IFS=,; echo "${now[*]}" | sed 's/,/, /g')"
+    for x in "${now[@]}"; do items+=("${red}${b}$x${r}"); done
   else
-    printf "${grn}ok${r}"
+    items+=("${grn}ok${r}")
   fi
-  if (( ${#past[@]} )); then
-    sep; printf "${yel}since boot: %s${r}" "$(IFS=,; echo "${past[*]}" | sed 's/,/, /g')"
-  fi
-  printf "  ${d}(%s)${r}\n" "$thr"
+  for i in "${!past[@]}"; do
+    (( i )) && items+=("${yel}${past[$i]}${r}") || items+=("${yel}since boot: ${past[$i]}${r}")
+  done
+  items+=("${d}($thr)${r}")
+  lab "Power"
+  wrap "$P1" "$P2" "$SEP" "${items[@]}"
 fi
 
 # Disks
 first=1
 while read -r target size used pcent; do
   p=${pcent%\%}
-  if (( first )); then label "Disks"; first=0; else printf "  %-9s" ""; fi
-  printf "%-14s " "$target"; bar "$p" 24
-  printf "  %3s%%  ${d}%s of %s${r}\n" "$p" "$used" "$size"
+  if (( first )); then lab "Disks"; printf "%s" "$P1"; first=0; else printf "%s" "$P2"; fi
+  [[ $target == /boot/firmware ]] && target=/boot/fw
+  printf "%-8s " "$target"; bar "$p" 18
+  printf " %3s%%  ${d}%s/%s${r}\n" "$p" "$used" "$size"
 done < <(df -h --output=target,size,used,pcent / /boot/firmware 2>/dev/null | tail -n +2)
 
 # Network: wired, then the Wi-Fi adapter (association details from iwd, ~0.1 s)
 ipv4() { ip -4 -br addr show "$1" 2>/dev/null | awk '{sub("/.*", "", $3); print $3}'; }
 lan=$(ipv4 eth0)
-label "Network"
-if [[ -n $lan ]]; then printf "eth0  %s\n" "$lan"; else printf "eth0  ${d}down${r}\n"; fi
+lab "Network"
+if [[ -n $lan ]]; then printf "%seth0  %s\n" "$P1" "$lan"; else printf "%seth0  ${d}down${r}\n" "$P1"; fi
 
 # iwd names the interface after its phy (wlan0 at boot, wlan1 after a re-plug), so find it
 wif=""
 for n in /sys/class/net/*/phy80211; do [[ -e $n ]] && { wif=${n%/phy80211}; wif=${wif##*/}; break; }; done
 if [[ -n $wif ]]; then
-  printf "  %-9s" ""
+  printf -v wn "%-5s " "$wif"
+  items=()
   rfk=0
   for f in /sys/class/net/$wif/phy80211/rfkill*/{soft,hard}; do
     [[ -r $f ]] && { read -r v < "$f"; (( v )) && rfk=1; }
   done
   if (( rfk )); then
-    printf "%-5s ${red}${b}blocked by rfkill${r}" "$wif"
+    items+=("$wn${red}${b}blocked by rfkill${r}")
   else
     # iwctl prints a table with colour codes; strip them, then pick "Key   value" rows
     # parsed in-shell: every extra fork costs ~0.1 s on a Pi 1
@@ -109,23 +131,22 @@ if [[ -n $wif ]]; then
       wip=${wi[IPv4 address]}
       ssid=${wi[Connected network]}; rssi=${wi[AverageRSSI]:-${wi[RSSI]}}
       freq=${wi[Frequency]}; chan=${wi[Channel]}; txr=${wi[TxBitrate]}
-      printf "%-5s %s" "$wif" "${wip:-${yel}no address${r}}"
-      sep; printf "%s" "$ssid"
+      items+=("$wn${wip:-${yel}no address${r}}" "$ssid")
       if [[ $rssi =~ ^(-?[0-9]+) ]]; then
         s=${BASH_REMATCH[1]} c=$grn
         (( s < -67 )) && c=$yel
         (( s < -75 )) && c=$red
-        sep; printf "%s%s dBm%s" "$c" "$s" "$r"
+        items+=("$c$s dBm$r")
       fi
       if [[ -n $freq ]]; then
         if (( freq >= 5000 )); then band="5 GHz"; else band="2.4 GHz"; fi
-        sep; printf "%s ch %s" "$band" "$chan"
+        items+=("$band ch $chan")
       fi
-      [[ $txr =~ ^([0-9]+) ]] && { sep; printf "%s Mbit/s" "$(( BASH_REMATCH[1] / 1000 ))"; }
+      [[ $txr =~ ^([0-9]+) ]] && items+=("$(( BASH_REMATCH[1] / 1000 )) Mbit/s")
     elif [[ -n $wstate ]]; then
-      printf "%-5s ${yel}%s${r}" "$wif" "$wstate"
+      items+=("$wn${yel}$wstate${r}")
     else
-      printf "%-5s ${red}off${r} ${d}(iwd has no station; powered off?)${r}" "$wif"
+      items+=("$wn${red}off${r}" "${d}(iwd has no station; powered off?)${r}")
     fi
   fi
   # adapter model from the udev hwdb, e.g. "AC600 ... [Archer T2U Nano]" -> "Archer T2U Nano"
@@ -138,9 +159,10 @@ if [[ -n $wif ]]; then
     done < "/run/udev/data/n$wifx" 2>/dev/null
   fi
   [[ $wmodel =~ \[(.*)\] ]] && wmodel=${BASH_REMATCH[1]}
+  (( ${#wmodel} > 24 )) && wmodel="${wmodel:0:23}…"   # one item can't wrap; keep it within $W
   wdrv=$(readlink /sys/class/net/$wif/device/driver 2>/dev/null); wdrv=${wdrv##*/}
-  [[ -n $wmodel ]] && printf "  ${d}(%s%s)${r}" "$wmodel" "${wdrv:+, $wdrv}"
-  echo
+  [[ -n $wmodel ]] && items+=("${d}$wmodel${wdrv:+, $wdrv}${r}")
+  wrap "$P2" "$P2      " "$SEP" "${items[@]}"   # continuations line up under the address
 fi
 
 # Service states, fetched once (each systemctl call costs ~0.35 s on a Pi 1)
@@ -150,56 +172,56 @@ declare -A state
 for i in "${!services[@]}"; do state[${services[$i]}]=${states[$i]}; done
 
 # SDR: which mode the dongle is in, and how readsb is doing
-label "SDR"
+lab "SDR"
+items=()
 if [[ ${state[readsb]} == active ]]; then
-  printf "${grn}ADS-B${r} (readsb)"
+  items+=("${grn}ADS-B${r} (readsb)")
   # one jq run for both files: aircraft now, aircraft with position, messages and max range (last minute)
   js=$(timeout 2 jq -rn --slurpfile a /run/readsb/aircraft.json --slurpfile s /run/readsb/stats.json \
        '($a[0].aircraft) as $ac | ($s[0].last1min) as $m
         | "\($ac | length) \([$ac[] | select(.lat)] | length) \($m.messages // 0) \($m.max_distance // 0)"' 2>/dev/null)
   if [[ -n $js ]]; then
     read -r n pos msgs maxd <<< "$js"
-    sep; printf "%s aircraft ${d}(%s with position)${r}" "$n" "$pos"
-    sep; printf "%s msg/s" "$(( msgs / 60 ))"
-    (( maxd > 0 )) && { sep; printf "range %s km" "$(( maxd / 1000 ))"; }
+    items+=("$n aircraft ${d}($pos with position)${r}" "$(( msgs / 60 )) msg/s")
+    (( maxd > 0 )) && items+=("range $(( maxd / 1000 )) km")
   fi
   if [[ ${state[adsbfi-feed]} == active ]]; then
     if ss -Htn state established '( dport = :30004 )' 2>/dev/null | grep -q .; then
-      sep; printf "adsb.fi ${grn}connected${r}"
+      items+=("adsb.fi ${grn}connected${r}")
     else
-      sep; printf "adsb.fi ${red}not connected${r}"
+      items+=("adsb.fi ${red}not connected${r}")
     fi
   fi
-  echo
 elif pgrep -f '^python3 /usr/local/bin/dvb-aim' >/dev/null; then
-  printf "${yel}antenna aiming${r} ${d}(dvb-aim running; readsb comes back when it exits)${r}\n"
+  items+=("${yel}antenna aiming${r}" "${d}(dvb-aim running; readsb resumes after)${r}")
 elif grep -q '^dvb_usb_rtl28xxu ' /proc/modules; then
-  printf "${yel}DVB-T mode${r} ${d}(readsb stopped; 'sdr-mode adsb' to go back)${r}\n"
+  items+=("${yel}DVB-T mode${r}" "${d}(readsb stopped; 'sdr-mode adsb' to go back)${r}")
 else
-  printf "${red}idle${r} ${d}(readsb stopped, DVB driver not loaded)${r}\n"
+  items+=("${red}idle${r}" "${d}(readsb stopped, DVB driver not loaded)${r}")
 fi
+wrap "$P1" "$P2" "$SEP" "${items[@]}"
 
 # Services
-label "Services"
-line=""; len=0
+items=()
 for i in "${!services[@]}"; do
-  s=${services[$i]}
   if [[ ${states[$i]} == active ]]; then dot="${grn}●${r}"; else dot="${red}●${r}"; fi
-  if (( len + ${#s} + 4 > 64 )); then printf "%s\n  %-9s" "${line%  }" ""; line=""; len=0; fi
-  line+="$dot $s  "; len=$(( len + ${#s} + 4 ))
+  items+=("$dot ${services[$i]}")
 done
-printf "%s\n" "${line%  }"
+lab "Services"
+wrap "$P1" "$P2" "  " "${items[@]}"
 
 # Problems worth noticing
 failed=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}')
 if [[ -n $failed ]]; then
   echo
-  printf "  ${red}${b}failed:${r} %s\n" "$(echo $failed)"
+  wrap "  ${red}${b}failed:${r} " "          " " " $failed
 fi
 if [[ -f /run/reboot-required ]]; then
   echo
-  printf "  ${yel}${b}reboot required${r}"
-  [[ -f /run/reboot-required.pkgs ]] && printf " ${d}(%s)${r}" "$(sort -u /run/reboot-required.pkgs | tr '\n' ' ' | sed 's/ $//')"
-  echo
+  pkgs=()
+  if [[ -f /run/reboot-required.pkgs ]]; then
+    while read -r x; do pkgs+=("$d$x$r"); done < <(sort -u /run/reboot-required.pkgs)
+  fi
+  wrap "  ${yel}${b}reboot required${r}${pkgs:+: }" "  " " " "${pkgs[@]}"
 fi
 echo
