@@ -18,12 +18,14 @@ Both get DHCPv4 addresses. Ethernet is preferred when it's plugged in (route met
 | `20-wired.network` | `/etc/systemd/network/20-wired.network` |
 | `25-wireless.network` | `/etc/systemd/network/25-wireless.network` |
 | `systemd-networkd-wait-online.service.d/any.conf` | `/etc/systemd/system/systemd-networkd-wait-online.service.d/any.conf` |
+| `modprobe.d/rfkill_unblock.conf` | `/etc/modprobe.d/rfkill_unblock.conf` |
 
 ```
 sudo apt install iwd
 sudo install -m644 20-wired.network 25-wireless.network /etc/systemd/network/
 sudo install -Dm644 systemd-networkd-wait-online.service.d/any.conf \
     /etc/systemd/system/systemd-networkd-wait-online.service.d/any.conf
+sudo install -m644 modprobe.d/rfkill_unblock.conf /etc/modprobe.d/   # takes effect at next boot
 sudo systemctl daemon-reload
 sudo systemctl enable --now systemd-networkd systemd-resolved iwd
 ```
@@ -31,6 +33,10 @@ sudo systemctl enable --now systemd-networkd systemd-resolved iwd
 iwd keeps its own address configuration off (`EnableNetworkConfiguration` stays unset in
 `/etc/iwd/main.conf`): iwd only associates, networkd does DHCP. `25-wireless.network` matches any
 station-mode Wi-Fi interface, so a different adapter works without editing it.
+
+The interface is `wlan0` after boot, but iwd recreates it named after its radio's phy number, and
+that number goes up every time the adapter is re-plugged while the Pi runs: `wlan1`, `wlan2`, and
+so on, until the next reboot. Nothing here depends on the name; the MOTD looks the interface up.
 
 Add a network (the passphrase ends up in `/var/lib/iwd/<ssid>.psk`, root-only, not in this repo):
 
@@ -67,18 +73,26 @@ happens to any Wi-Fi radio that shows up after the country was set:
 The login hint from `/etc/profile.d/wifi-check.sh` stays quiet because the country is set on the
 kernel command line (`cfg80211.ieee80211_regdom=PT`).
 
-Fix (the state file is per USB port, so a different port starts blocked again):
+**Prevention (installed):** the country is already set on the kernel command line, so that
+guard only gets in the way. `modprobe.d/rfkill_unblock.conf` sets `options rfkill
+default_state=1`. modprobe applies option lines in file-name order and the last value wins, so
+the file must sort after `rfkill_default.conf` (check with `sudo /usr/sbin/modprobe -c | grep
+rfkill`). The rfkill module isn't in the initramfs, so `update-initramfs` isn't needed, but the
+module is loaded early by cfg80211 and can't be reloaded: it takes effect at the next boot
+(`cat /sys/module/rfkill/parameters/default_state` shows `1`). Tested by unbinding the adapter,
+deleting its saved state and binding it again: the radio came back unblocked and reconnected.
+
+**One-off fix** for a radio that is already blocked. systemd-rfkill keeps a saved state per USB
+port, so a block saved earlier still comes back at boot even with the override installed:
 
 ```
-R=$(dirname $(grep -l phy0 /sys/class/rfkill/*/name))
+R=$(dirname $(grep -l phy /sys/class/rfkill/*/name | head -1))
 echo 0 | sudo tee $R/soft
 for f in /var/lib/systemd/rfkill/*usb*:wlan; do echo 0 | sudo tee "$f"; done
 iwctl device wlan0 set-property Powered on
 ```
 
-Since the country is already set on the command line, a permanent alternative is
-`options rfkill default_state=1` in a modprobe.d file that sorts after `rfkill_default.conf`
-(not installed here). The MOTD shows `wlan0 blocked by rfkill` in red when this happens.
+The MOTD shows `wlan0 blocked by rfkill` in red when this happens.
 
 ## Throughput
 

@@ -86,27 +86,30 @@ lan=$(ipv4 eth0)
 label "Network"
 if [[ -n $lan ]]; then printf "eth0  %s\n" "$lan"; else printf "eth0  ${d}down${r}\n"; fi
 
-if [[ -e /sys/class/net/wlan0 ]]; then
+# iwd names the interface after its phy (wlan0 at boot, wlan1 after a re-plug), so find it
+wif=""
+for n in /sys/class/net/*/phy80211; do [[ -e $n ]] && { wif=${n%/phy80211}; wif=${wif##*/}; break; }; done
+if [[ -n $wif ]]; then
   printf "  %-9s" ""
   rfk=0
-  for f in /sys/class/net/wlan0/phy80211/rfkill*/{soft,hard}; do
+  for f in /sys/class/net/$wif/phy80211/rfkill*/{soft,hard}; do
     [[ -r $f ]] && { read -r v < "$f"; (( v )) && rfk=1; }
   done
   if (( rfk )); then
-    printf "wlan0 ${red}${b}blocked by rfkill${r}"
+    printf "%-5s ${red}${b}blocked by rfkill${r}" "$wif"
   else
     # iwctl prints a table with colour codes; strip them, then pick "Key   value" rows
     # parsed in-shell: every extra fork costs ~0.1 s on a Pi 1
     declare -A wi
     while IFS= read -r l; do
       [[ $l =~ ^\ +([A-Za-z0-9][A-Za-z0-9 ]*[A-Za-z0-9])\ {2,}(.*[^ ])\ *$ ]] && wi[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
-    done < <(timeout 2 iwctl station wlan0 show 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+    done < <(timeout 2 iwctl station "$wif" show 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
     wstate=${wi[State]}
     if [[ $wstate == connected ]]; then
       wip=${wi[IPv4 address]}
       ssid=${wi[Connected network]}; rssi=${wi[AverageRSSI]:-${wi[RSSI]}}
       freq=${wi[Frequency]}; chan=${wi[Channel]}; txr=${wi[TxBitrate]}
-      printf "wlan0 %s" "${wip:-${yel}no address${r}}"
+      printf "%-5s %s" "$wif" "${wip:-${yel}no address${r}}"
       sep; printf "%s" "$ssid"
       if [[ $rssi =~ ^(-?[0-9]+) ]]; then
         s=${BASH_REMATCH[1]} c=$grn
@@ -120,22 +123,22 @@ if [[ -e /sys/class/net/wlan0 ]]; then
       fi
       [[ $txr =~ ^([0-9]+) ]] && { sep; printf "%s Mbit/s" "$(( BASH_REMATCH[1] / 1000 ))"; }
     elif [[ -n $wstate ]]; then
-      printf "wlan0 ${yel}%s${r}" "$wstate"
+      printf "%-5s ${yel}%s${r}" "$wif" "$wstate"
     else
-      printf "wlan0 ${red}off${r} ${d}(iwd has no station; powered off?)${r}"
+      printf "%-5s ${red}off${r} ${d}(iwd has no station; powered off?)${r}" "$wif"
     fi
   fi
   # adapter model from the udev hwdb, e.g. "AC600 ... [Archer T2U Nano]" -> "Archer T2U Nano"
   # (read straight from udev's database file, avoiding a 0.2 s udevadm call)
   wmodel=""
-  if [[ -r /sys/class/net/wlan0/ifindex ]]; then
-    read -r wifx < /sys/class/net/wlan0/ifindex
+  if [[ -r /sys/class/net/$wif/ifindex ]]; then
+    read -r wifx < /sys/class/net/$wif/ifindex
     while IFS= read -r l; do
       [[ $l == E:ID_MODEL_FROM_DATABASE=* ]] && { wmodel=${l#*=}; break; }
     done < "/run/udev/data/n$wifx" 2>/dev/null
   fi
   [[ $wmodel =~ \[(.*)\] ]] && wmodel=${BASH_REMATCH[1]}
-  wdrv=$(readlink /sys/class/net/wlan0/device/driver 2>/dev/null); wdrv=${wdrv##*/}
+  wdrv=$(readlink /sys/class/net/$wif/device/driver 2>/dev/null); wdrv=${wdrv##*/}
   [[ -n $wmodel ]] && printf "  ${d}(%s%s)${r}" "$wmodel" "${wdrv:+, $wdrv}"
   echo
 fi
