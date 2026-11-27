@@ -110,3 +110,19 @@ Then add `--lat <lat> --lon <lon>` to `DECODER_OPTIONS` in `/etc/default/readsb`
 **Pi 1 limits.** Over `rtl_tcp` the Pi 1 sustains only about 2.0 Msps, so at 2.048 Msps the
 stream falls behind and lags retunes by seconds. Use 1.8 Msps or less for anything that retunes.
 Decoding on the Pi itself, as here, avoids the problem.
+
+**rtl_tcp over Wi-Fi.** The Wi-Fi link carries about 20 Mbit/s (`network/README.md`), and
+`rtl_tcp` sends 2 bytes per sample, so the ceiling is about 1.2 Msps. Measured with readsb stopped,
+30 s per run, the client on a wired LAN host:
+
+| Requested | Delivered |
+|---|---|
+| 0.900 Msps | 0.875–0.900 Msps (97–100%) |
+| 1.024 Msps | 1.005–1.013 Msps (98–99%) |
+| 1.200 Msps | 1.170–1.198 Msps (97.5–99.8%) |
+| 1.4–2.4 Msps | 1.1–1.4 Msps, link saturated |
+
+USB is not the problem: `rtl_test -s 2400000` on the Pi loses next to nothing. Use 1.024 Msps
+over Wi-Fi (1.2 works with no headroom); even then expect an occasional short stall. ADS-B over
+`rtl_tcp` (2–2.4 Msps) needs a wired link. `rtl_tcp` takes a few seconds to release the dongle
+after it's stopped; wait for the process to exit before starting another one.

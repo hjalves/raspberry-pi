@@ -1,0 +1,14 @@
+# Wi-Fi station links: iwd associates, networkd configures addressing
+[Match]
+Type=wlan
+WLANInterfaceType=station
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+MulticastDNS=yes
+IgnoreCarrierLoss=3s
+
+[DHCPv4]
+# keep eth0 (metric 1024) as the preferred default route
+RouteMetric=2048

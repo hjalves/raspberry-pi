@@ -80,10 +80,65 @@ while read -r target size used pcent; do
   printf "  %3s%%  ${d}%s of %s${r}\n" "$p" "$used" "$size"
 done < <(df -h --output=target,size,used,pcent / /boot/firmware 2>/dev/null | tail -n +2)
 
-# Network
-lan=$(ip -4 -br addr show eth0 2>/dev/null | awk '{sub("/.*", "", $3); print $3}')
+# Network: wired, then the Wi-Fi adapter (association details from iwd, ~0.1 s)
+ipv4() { ip -4 -br addr show "$1" 2>/dev/null | awk '{sub("/.*", "", $3); print $3}'; }
+lan=$(ipv4 eth0)
 label "Network"
-printf "eth0 %s\n" "${lan:-down}"
+if [[ -n $lan ]]; then printf "eth0  %s\n" "$lan"; else printf "eth0  ${d}down${r}\n"; fi
+
+if [[ -e /sys/class/net/wlan0 ]]; then
+  printf "  %-9s" ""
+  rfk=0
+  for f in /sys/class/net/wlan0/phy80211/rfkill*/{soft,hard}; do
+    [[ -r $f ]] && { read -r v < "$f"; (( v )) && rfk=1; }
+  done
+  if (( rfk )); then
+    printf "wlan0 ${red}${b}blocked by rfkill${r}"
+  else
+    # iwctl prints a table with colour codes; strip them, then pick "Key   value" rows
+    # parsed in-shell: every extra fork costs ~0.1 s on a Pi 1
+    declare -A wi
+    while IFS= read -r l; do
+      [[ $l =~ ^\ +([A-Za-z0-9][A-Za-z0-9 ]*[A-Za-z0-9])\ {2,}(.*[^ ])\ *$ ]] && wi[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+    done < <(timeout 2 iwctl station wlan0 show 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+    wstate=${wi[State]}
+    if [[ $wstate == connected ]]; then
+      wip=${wi[IPv4 address]}
+      ssid=${wi[Connected network]}; rssi=${wi[AverageRSSI]:-${wi[RSSI]}}
+      freq=${wi[Frequency]}; chan=${wi[Channel]}; txr=${wi[TxBitrate]}
+      printf "wlan0 %s" "${wip:-${yel}no address${r}}"
+      sep; printf "%s" "$ssid"
+      if [[ $rssi =~ ^(-?[0-9]+) ]]; then
+        s=${BASH_REMATCH[1]} c=$grn
+        (( s < -67 )) && c=$yel
+        (( s < -75 )) && c=$red
+        sep; printf "%s%s dBm%s" "$c" "$s" "$r"
+      fi
+      if [[ -n $freq ]]; then
+        if (( freq >= 5000 )); then band="5 GHz"; else band="2.4 GHz"; fi
+        sep; printf "%s ch %s" "$band" "$chan"
+      fi
+      [[ $txr =~ ^([0-9]+) ]] && { sep; printf "%s Mbit/s" "$(( BASH_REMATCH[1] / 1000 ))"; }
+    elif [[ -n $wstate ]]; then
+      printf "wlan0 ${yel}%s${r}" "$wstate"
+    else
+      printf "wlan0 ${red}off${r} ${d}(iwd has no station; powered off?)${r}"
+    fi
+  fi
+  # adapter model from the udev hwdb, e.g. "AC600 ... [Archer T2U Nano]" -> "Archer T2U Nano"
+  # (read straight from udev's database file, avoiding a 0.2 s udevadm call)
+  wmodel=""
+  if [[ -r /sys/class/net/wlan0/ifindex ]]; then
+    read -r wifx < /sys/class/net/wlan0/ifindex
+    while IFS= read -r l; do
+      [[ $l == E:ID_MODEL_FROM_DATABASE=* ]] && { wmodel=${l#*=}; break; }
+    done < "/run/udev/data/n$wifx" 2>/dev/null
+  fi
+  [[ $wmodel =~ \[(.*)\] ]] && wmodel=${BASH_REMATCH[1]}
+  wdrv=$(readlink /sys/class/net/wlan0/device/driver 2>/dev/null); wdrv=${wdrv##*/}
+  [[ -n $wmodel ]] && printf "  ${d}(%s%s)${r}" "$wmodel" "${wdrv:+, $wdrv}"
+  echo
+fi
 
 # Service states, fetched once (each systemctl call costs ~0.35 s on a Pi 1)
 services=(readsb tar1090 lighttpd landing adsbfi-feed adsbfi-mlat ssh systemd-timesyncd)
